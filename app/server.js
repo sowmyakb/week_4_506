@@ -11,6 +11,20 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'static')));
 
 // ---------------------------------------------------------------------------
+// Debug instrumentation
+// ---------------------------------------------------------------------------
+// Set DEBUG_RACE=1 to enable timestamped logging of handler entry/exit and
+// state transitions. Leave off in production; controlled via env var.
+const DEBUG = process.env.DEBUG_RACE === '1';
+
+function log(tag, msg, extra) {
+  if (!DEBUG) return;
+  const ts = new Date().toISOString();
+  const payload = extra !== undefined ? ` | ${JSON.stringify(extra)}` : '';
+  console.log(`[${ts}] [${tag}] ${msg}${payload}`);
+}
+
+// ---------------------------------------------------------------------------
 // In-memory storage
 // ---------------------------------------------------------------------------
 // `currentDraft` is the most recent saved draft.
@@ -20,6 +34,13 @@ app.use(express.static(path.join(__dirname, 'static')));
 // is fine — the bug is in the timing, not the storage.
 let currentDraft = '';
 let publishedDraft = '';
+
+// `pendingSave` tracks the most recent in-flight /draft request.
+// It is a Promise that resolves once the save has committed to currentDraft.
+// Starts as an already-resolved promise so publish works even before any save.
+// FIX: /publish awaits this before reading currentDraft, ensuring it always
+// sees the most recently initiated save, not a stale committed value.
+let pendingSave = Promise.resolve();
 
 // SAVE_COMMIT_DELAY_MS controls how long a /draft request takes to commit.
 // In production this would represent database write latency, network latency,
@@ -43,20 +64,42 @@ app.post('/draft', (req, res) => {
     return res.status(400).json({ error: 'content must be a string' });
   }
 
+  log('SAVE', 'request received', { content, currentDraftBefore: currentDraft });
+
   // Simulate write latency.
-  setTimeout(() => {
-    currentDraft = content;
-    res.json({ ok: true, saved: content });
-  }, SAVE_COMMIT_DELAY_MS);
+  // FIX: wrap the timeout in a Promise and assign it to pendingSave so that
+  // /publish can await it before reading currentDraft.
+  // Only the most recent save is tracked (last-write-wins semantics).
+  pendingSave = new Promise((resolve, reject) => {
+    setTimeout(() => {
+      try {
+        const prev = currentDraft;
+        currentDraft = content;
+        log('SAVE', 'committed to currentDraft', { content, prevDraft: prev, currentDraftAfter: currentDraft });
+        resolve();
+        res.json({ ok: true, saved: content });
+      } catch (err) {
+        reject(err);
+      }
+    }, SAVE_COMMIT_DELAY_MS);
+  });
 });
 
 // POST /publish — mark the most recent saved draft as live.
 //
-// THE BUG: this reads currentDraft *immediately*. If a /draft request is
-// in flight (its timeout hasn't fired), publishedDraft will be set to the
-// older saved value, not the in-flight one.
-app.post('/publish', (req, res) => {
+// FIX: await pendingSave before reading currentDraft. This ensures that if a
+// /draft request is in flight when publish arrives, publish will block until
+// the save commits, then read the freshly committed value.
+app.post('/publish', async (req, res) => {
+  log('PUBLISH', 'request received — awaiting any in-flight save', { currentDraftBeforeAwait: currentDraft });
+  // Assumption: saves always resolve (setTimeout always fires).
+  // In production, add a Promise.race with a deadline to avoid indefinite blocking.
+  await pendingSave.catch((err) => {
+    log('PUBLISH', 'pendingSave rejected — proceeding with current state', { err: err.message });
+  });
+  log('PUBLISH', 'pendingSave resolved — reading currentDraft', { currentDraftAfterAwait: currentDraft });
   publishedDraft = currentDraft;
+  log('PUBLISH', 'published', { publishedDraft });
   res.json({ ok: true, published: publishedDraft });
 });
 
@@ -72,6 +115,7 @@ app.get('/current', (req, res) => {
 
 // Reset endpoint for tests.
 app.post('/reset', (req, res) => {
+  log('RESET', 'state cleared');
   currentDraft = '';
   publishedDraft = '';
   res.json({ ok: true });
@@ -86,6 +130,7 @@ if (require.main === module) {
   app.listen(PORT, () => {
     console.log(`Draft editor running on http://localhost:${PORT}`);
     console.log(`SAVE_COMMIT_DELAY_MS = ${SAVE_COMMIT_DELAY_MS}`);
+    console.log(`DEBUG_RACE = ${process.env.DEBUG_RACE || '0'}`);
   });
 }
 
