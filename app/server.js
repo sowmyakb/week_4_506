@@ -11,6 +11,20 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'static')));
 
 // ---------------------------------------------------------------------------
+// Debug instrumentation
+// ---------------------------------------------------------------------------
+// Set DEBUG_RACE=1 to enable timestamped logging of handler entry/exit and
+// state transitions. Leave off in production; controlled via env var.
+const DEBUG = process.env.DEBUG_RACE === '1';
+
+function log(tag, msg, extra) {
+  if (!DEBUG) return;
+  const ts = new Date().toISOString();
+  const payload = extra !== undefined ? ` | ${JSON.stringify(extra)}` : '';
+  console.log(`[${ts}] [${tag}] ${msg}${payload}`);
+}
+
+// ---------------------------------------------------------------------------
 // In-memory storage
 // ---------------------------------------------------------------------------
 // `currentDraft` is the most recent saved draft.
@@ -43,9 +57,13 @@ app.post('/draft', (req, res) => {
     return res.status(400).json({ error: 'content must be a string' });
   }
 
+  log('SAVE', 'request received', { content, currentDraftBefore: currentDraft });
+
   // Simulate write latency.
   setTimeout(() => {
+    const prev = currentDraft;
     currentDraft = content;
+    log('SAVE', 'committed to currentDraft', { content, prevDraft: prev, currentDraftAfter: currentDraft });
     res.json({ ok: true, saved: content });
   }, SAVE_COMMIT_DELAY_MS);
 });
@@ -56,7 +74,9 @@ app.post('/draft', (req, res) => {
 // in flight (its timeout hasn't fired), publishedDraft will be set to the
 // older saved value, not the in-flight one.
 app.post('/publish', (req, res) => {
+  log('PUBLISH', 'request received', { currentDraftAtPublishTime: currentDraft, publishedDraftBefore: publishedDraft });
   publishedDraft = currentDraft;
+  log('PUBLISH', 'published', { publishedDraft });
   res.json({ ok: true, published: publishedDraft });
 });
 
@@ -72,6 +92,7 @@ app.get('/current', (req, res) => {
 
 // Reset endpoint for tests.
 app.post('/reset', (req, res) => {
+  log('RESET', 'state cleared');
   currentDraft = '';
   publishedDraft = '';
   res.json({ ok: true });
@@ -86,6 +107,7 @@ if (require.main === module) {
   app.listen(PORT, () => {
     console.log(`Draft editor running on http://localhost:${PORT}`);
     console.log(`SAVE_COMMIT_DELAY_MS = ${SAVE_COMMIT_DELAY_MS}`);
+    console.log(`DEBUG_RACE = ${process.env.DEBUG_RACE || '0'}`);
   });
 }
 
